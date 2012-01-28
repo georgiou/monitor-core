@@ -1692,12 +1692,59 @@ print_host_end( apr_socket_t *client)
   return socket_send(client, "</HOST>\n", &len); 
 }
 
-static void
-process_tcp_accept_channel(const apr_pollfd_t *desc, apr_time_t now)
+static apr_status_t
+print_xml(apr_socket_t *client, apr_time_t now, apr_pool_t *client_context)
 {
   apr_status_t status;
   apr_hash_index_t *hi, *metric_hi;
   void *val;
+
+  /* Print the DTD, GANGLIA_XML and CLUSTER tags */
+  status = print_xml_header(client);
+  if(status != APR_SUCCESS)
+    return status;
+
+  /* Walk the host hash */
+  for(hi = apr_hash_first(client_context, hosts);
+      hi;
+      hi = apr_hash_next(hi))
+    {
+      apr_hash_this(hi, NULL, NULL, &val);
+      status = print_host_start(client, (Ganglia_host *)val);
+      if(status != APR_SUCCESS)
+        return status;
+
+      /* Send the metric info for this particular host */
+      for(metric_hi = apr_hash_first(client_context, ((Ganglia_host *)val)->metrics);
+          metric_hi; metric_hi = apr_hash_next(metric_hi))
+        {
+          void *metric, *mval;
+          apr_hash_this(metric_hi, NULL, NULL, &metric);
+
+          mval = apr_hash_get(((Ganglia_host *)val)->gmetrics, ((Ganglia_metadata*)metric)->name, APR_HASH_KEY_STRING);
+
+          /* Print each of the metrics for a host ... */
+          if(print_host_metric(client, metric, mval, now) != APR_SUCCESS)
+            return status;
+        }
+
+      /* Close the host tag */
+      status = print_host_end(client);
+      if(status != APR_SUCCESS)
+        return status;
+    }
+
+  /* Close the CLUSTER and GANGLIA_XML tags */
+  print_xml_footer(client);
+  /* XXX */
+  return APR_SUCCESS;
+}
+
+
+static void
+process_tcp_accept_channel(const apr_pollfd_t *desc, apr_time_t now)
+{
+  apr_status_t status;
   apr_socket_t *client, *server;
   apr_sockaddr_t *remotesa = NULL;
   char  remoteip[256];
@@ -1715,16 +1762,14 @@ process_tcp_accept_channel(const apr_pollfd_t *desc, apr_time_t now)
   /* Accept the connection */
   status = apr_socket_accept(&client, server, client_context);
   if(status != APR_SUCCESS)
-    {
-      goto close_accept_socket;
-    }
+    goto close_accept_socket;
 
   /* Set the timeout for writing to the client */
   apr_socket_timeout_set( client, channel->timeout);
 
   apr_socket_addr_get(&remotesa, APR_REMOTE, client);
   /* This function is in ./lib/apr_net.c and not APR. The
-   * APR counterpart is apr_sockaddr_ip_get() but we don't 
+   * APR counterpart is apr_sockaddr_ip_get() but we don't
    * want to malloc memory evertime we call this */
   apr_sockaddr_ip_buffer_get(remoteip, 256, remotesa);
 
@@ -1732,49 +1777,8 @@ process_tcp_accept_channel(const apr_pollfd_t *desc, apr_time_t now)
   if(Ganglia_acl_action( channel->acl, remotesa ) != GANGLIA_ACCESS_ALLOW)
     goto close_accept_socket;
 
-  /* Print the DTD, GANGLIA_XML and CLUSTER tags */
-  status = print_xml_header(client);
-  if(status != APR_SUCCESS)
+  if(!print_xml(client, now, client_context))
     goto close_accept_socket;
-
-  /* Walk the host hash */
-  for(hi = apr_hash_first(client_context, hosts);
-      hi;
-      hi = apr_hash_next(hi))
-    {
-      apr_hash_this(hi, NULL, NULL, &val);
-      status = print_host_start(client, (Ganglia_host *)val);
-      if(status != APR_SUCCESS)
-        {
-          goto close_accept_socket;
-        }
-
-      /* Send the metric info for this particular host */
-      for(metric_hi = apr_hash_first(client_context, ((Ganglia_host *)val)->metrics);
-          metric_hi; metric_hi = apr_hash_next(metric_hi))
-        {
-          void *metric, *mval;
-          apr_hash_this(metric_hi, NULL, NULL, &metric);
-
-          mval = apr_hash_get(((Ganglia_host *)val)->gmetrics, ((Ganglia_metadata*)metric)->name, APR_HASH_KEY_STRING);
-
-          /* Print each of the metrics for a host ... */
-          if(print_host_metric(client, metric, mval, now) != APR_SUCCESS)
-            {
-              goto close_accept_socket;
-            }
-        }
-
-      /* Close the host tag */
-      status = print_host_end(client);
-      if(status != APR_SUCCESS)
-        {
-          goto close_accept_socket;
-        }
-    }
-
-  /* Close the CLUSTER and GANGLIA_XML tags */
-  print_xml_footer(client);
 
   /* Close down the accepted socket */
 close_accept_socket:
@@ -1782,7 +1786,6 @@ close_accept_socket:
   apr_socket_close(client);
   apr_pool_destroy(client_context);
 }
-
 
 static void
 poll_listen_channels( apr_interval_time_t timeout, apr_time_t now)
