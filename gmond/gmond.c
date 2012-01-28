@@ -135,8 +135,16 @@ enum Ganglia_channel_types {
 };
 typedef enum Ganglia_channel_types Ganglia_channel_types;
 
+enum Ganglia_encoding_types {
+  XDR_ENCODING,
+  XML_ENCODING,
+  JSON_ENCODING
+};
+typedef enum Ganglia_encoding_types Ganglia_encoding_types;
+
 struct Ganglia_channel {
   Ganglia_channel_types type;
+  Ganglia_encoding_types encoding;
   Ganglia_acl *acl;
   int timeout;
 };
@@ -704,7 +712,7 @@ setup_listen_channels_pollset( int reset )
   for(i=0; i< num_tcp_accept_channels; i++)
     {
       cfg_t *tcp_accept_channel = cfg_getnsec( config_file, "tcp_accept_channel", i);
-      char *bindaddr, *interface, *family;
+      char *bindaddr, *interface, *family, *encoding;
       int port, timeout;
       apr_socket_t *socket = NULL;
       apr_pollfd_t socket_pollfd;
@@ -716,6 +724,7 @@ setup_listen_channels_pollset( int reset )
       interface      = cfg_getstr( tcp_accept_channel, "interface"); 
       timeout        = cfg_getint( tcp_accept_channel, "timeout");
       family         = cfg_getstr( tcp_accept_channel, "family");
+      encoding       = cfg_getstr( tcp_accept_channel, "encoding");
 
       debug_msg("tcp_accept_channel bind=%s port=%d",
                 bindaddr? bindaddr: "NULL", port);
@@ -755,6 +764,17 @@ setup_listen_channels_pollset( int reset )
 
       /* Save the ACL information */
       channel->acl = Ganglia_acl_create( tcp_accept_channel, pool ); 
+
+      /* Save the output encoding */
+      if(strcmp(encoding, "xml") == 0)
+        channel->encoding = XML_ENCODING;
+      else if(strcmp(encoding, "json") == 0)
+        channel->encoding = JSON_ENCODING;
+      else
+        {
+          err_msg("Unknown encoding for tcp_accept_channel.\n");
+          exit(1);
+        }
 
       /* Save the pointer to this channel data */
       socket_pollfd.client_data = channel;
@@ -1777,8 +1797,15 @@ process_tcp_accept_channel(const apr_pollfd_t *desc, apr_time_t now)
   if(Ganglia_acl_action( channel->acl, remotesa ) != GANGLIA_ACCESS_ALLOW)
     goto close_accept_socket;
 
-  if(!print_xml(client, now, client_context))
-    goto close_accept_socket;
+  switch(channel->encoding) {
+    case JSON_ENCODING:
+      err_msg("JSON Encoding Here.....");
+      break;
+    case XML_ENCODING:
+    default: /* XML */   
+      if(!print_xml(client, now, client_context))
+        goto close_accept_socket;
+  }
 
   /* Close down the accepted socket */
 close_accept_socket:
