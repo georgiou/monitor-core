@@ -1520,7 +1520,7 @@ print_xml_footer( apr_socket_t *client )
 }
 
 static apr_status_t
-print_host_start( apr_socket_t *client, Ganglia_host *hostinfo)
+print_xml_host_start( apr_socket_t *client, Ganglia_host *hostinfo)
 {
   apr_size_t len;
   char hostxml[1024]; /* for <HOST></HOST> */
@@ -1650,7 +1650,7 @@ gmetric_value_to_str(Ganglia_value_msg *message)
 }
 
 static apr_status_t
-print_host_metric( apr_socket_t *client, Ganglia_metadata *data, Ganglia_metadata *val, apr_time_t now )
+print_xml_host_metric( apr_socket_t *client, Ganglia_metadata *data, Ganglia_metadata *val, apr_time_t now )
 {
   char metricxml[1024];
   apr_size_t len;
@@ -1706,7 +1706,7 @@ print_host_metric( apr_socket_t *client, Ganglia_metadata *data, Ganglia_metadat
 }
 
 static apr_status_t
-print_host_end( apr_socket_t *client)
+print_xml_host_end( apr_socket_t *client)
 {
   apr_size_t len = 8;
   return socket_send(client, "</HOST>\n", &len); 
@@ -1730,7 +1730,7 @@ print_xml(apr_socket_t *client, apr_time_t now, apr_pool_t *client_context)
       hi = apr_hash_next(hi))
     {
       apr_hash_this(hi, NULL, NULL, &val);
-      status = print_host_start(client, (Ganglia_host *)val);
+      status = print_xml_host_start(client, (Ganglia_host *)val);
       if(status != APR_SUCCESS)
         return status;
 
@@ -1744,22 +1744,258 @@ print_xml(apr_socket_t *client, apr_time_t now, apr_pool_t *client_context)
           mval = apr_hash_get(((Ganglia_host *)val)->gmetrics, ((Ganglia_metadata*)metric)->name, APR_HASH_KEY_STRING);
 
           /* Print each of the metrics for a host ... */
-          if(print_host_metric(client, metric, mval, now) != APR_SUCCESS)
+          if(print_xml_host_metric(client, metric, mval, now) != APR_SUCCESS)
             return status;
         }
 
       /* Close the host tag */
-      status = print_host_end(client);
+      status = print_xml_host_end(client);
       if(status != APR_SUCCESS)
         return status;
     }
 
   /* Close the CLUSTER and GANGLIA_XML tags */
-  print_xml_footer(client);
-  /* XXX */
-  return APR_SUCCESS;
+  return print_xml_footer(client);
 }
 
+static apr_status_t
+print_json_header( apr_socket_t *client )
+{
+  apr_status_t status;
+  apr_size_t len = strlen(DTD);
+  char gangliajson[128];
+  char clusterjson[1024];
+  static int clusterinit = 0;
+  static char *name = NULL;
+  static char *owner = NULL;
+  static char *latlong = NULL;
+  static char *url = NULL;
+  apr_time_t now = apr_time_now();
+
+  len = apr_snprintf( gangliajson, 128, "{\"ganglia_json\":{ \"version\":\"%s\",\"source\":\"gmond\",",
+                      VERSION);
+  status = socket_send( client, gangliajson, &len);
+  if(status != APR_SUCCESS)
+    return status;
+
+  if(!clusterinit)
+    {
+      /* We only run this on the first connection we process */
+      cfg_t *cluster = cfg_getsec(config_file, "cluster");
+      if(cluster)
+        {
+          name    = cfg_getstr( cluster, "name" );
+          owner   = cfg_getstr( cluster, "owner" );
+          latlong = cfg_getstr( cluster, "latlong" );
+          url     = cfg_getstr( cluster, "url" );
+          if(name || owner || latlong || url)
+            {
+              cluster_tag =1;
+            }
+        }
+      clusterinit = 1;
+    }
+
+  if(cluster_tag)
+    {
+      len = apr_snprintf( clusterjson, 1024, 
+        "\"cluster\":{\"name\":\"%s\",\"localtime\":%d,\"owner\":\"%s\",\"latlong\":\"%s\",\"url\":\"%s\",", 
+                  name?name:"unspecified", 
+                  (int)(now / APR_USEC_PER_SEC),
+                  owner?owner:"unspecified", 
+                  latlong?latlong:"unspecified",
+                  url?url:"unspecified");
+
+      status = socket_send( client, clusterjson, &len);
+      if(status != APR_SUCCESS)
+        return status;
+    }
+
+  len = apr_snprintf( gangliajson, 128, "\"host\":[",
+                      VERSION);
+  return socket_send( client, gangliajson, &len);
+}
+
+static apr_status_t
+print_json_footer( apr_socket_t *client )
+{
+  apr_status_t status;
+  apr_size_t len; 
+  if(cluster_tag)
+    {
+      len = 2;
+      status = socket_send(client, "]}", &len);
+      if(status != APR_SUCCESS)
+        {
+          return status;
+        }
+    }
+  len = 2;
+  return socket_send( client, "}}", &len);
+}
+
+static apr_status_t
+print_json_host_start( apr_socket_t *client, Ganglia_host *hostinfo)
+{
+  apr_size_t len;
+  char hostjson[1024];
+  apr_time_t now = apr_time_now();
+  int tn = (now - hostinfo->last_heard_from) / APR_USEC_PER_SEC;
+
+  len = apr_snprintf(hostjson, 1024, 
+           "{ \"name\": \"%s\", \"ip\": \"%s\", \"tags\": \"%s\", \"reported\": %d, \"tn\": %d, \"tmax\": %d, \"dmax\": %d, \"location\": \"%s\", \"gmond_started\": %d, \"metric\":[",
+                     hostinfo->hostname, 
+                     hostinfo->ip,
+                     tags ? tags : "",
+                     (int)(hostinfo->last_heard_from / APR_USEC_PER_SEC),
+                     tn,
+                     host_tmax,
+                     host_dmax,
+                     hostinfo->location? hostinfo->location: "unspecified", 
+                     hostinfo->gmond_started);
+
+  return socket_send(client, hostjson, &len);
+}
+
+static apr_status_t
+print_json_host_metric( apr_socket_t *client, Ganglia_metadata *data, Ganglia_metadata *val, apr_time_t now, int *metricused )
+{
+  char metricjson[1024];
+  apr_size_t len;
+  apr_status_t ret;
+  char *metricName=NULL, *realName=NULL;
+
+  *metricused=0;
+
+  if (!data || !val)
+      return APR_SUCCESS;
+
+  get_metric_names (&(data->message_u.f_message.Ganglia_metadata_msg_u.gfull.metric_id), &metricName, &realName);
+
+  if (!metricName || (!strcasecmp(metricName, "heartbeat") || !strcasecmp(metricName, "location"))) 
+    {
+      if (metricName) free(metricName);
+      if (realName) free(realName);
+      return APR_SUCCESS;
+    }
+  
+  len = apr_snprintf(metricjson, 1024,
+          "{\"name\":\"%s\", \"val\":\"%s\", \"type\":\"%s\", \"units\":\"%s\", \"tn\":%d, \"tmax\":%d, \"dmax\":%d, \"slope\":\"%s\"",
+              metricName,
+              gmetric_value_to_str(&(val->message_u.v_message)),
+              data->message_u.f_message.Ganglia_metadata_msg_u.gfull.metric.type,
+              data->message_u.f_message.Ganglia_metadata_msg_u.gfull.metric.units,
+              (int)((now - val->last_heard_from) / APR_USEC_PER_SEC),
+              data->message_u.f_message.Ganglia_metadata_msg_u.gfull.metric.tmax,
+              data->message_u.f_message.Ganglia_metadata_msg_u.gfull.metric.dmax,
+              slope_to_cstr(data->message_u.f_message.Ganglia_metadata_msg_u.gfull.metric.slope));
+
+  if (metricName) free(metricName);
+  if (realName) free(realName);
+
+  *metricused=1;
+  ret = socket_send(client, metricjson, &len);
+  if ((ret == APR_SUCCESS) && allow_extra_data) 
+    {
+      int extra_len = data->message_u.f_message.Ganglia_metadata_msg_u.gfull.metric.metadata.metadata_len;
+      len = apr_snprintf(metricjson, 1024, ",\"extra_data\":{ \"extra_element\":[");
+      socket_send(client, metricjson, &len);
+      for (; extra_len > 0; extra_len--) 
+        {
+          len = apr_snprintf(metricjson, 1024, "{ \"name\":\"%s\", \"val\":\"%s\"}%s",
+                 data->message_u.f_message.Ganglia_metadata_msg_u.gfull.metric.metadata.metadata_val[extra_len-1].name,
+                 data->message_u.f_message.Ganglia_metadata_msg_u.gfull.metric.metadata.metadata_val[extra_len-1].data,
+                 (extra_len!=1)?",":"");
+          socket_send(client, metricjson, &len);
+        }
+        len = apr_snprintf(metricjson, 1024, "]}");
+        socket_send(client, metricjson, &len);
+    }
+  /* Send the closing } */
+  len = apr_snprintf(metricjson, 1024, "}");
+
+  return socket_send(client, metricjson, &len);
+}
+
+static apr_status_t
+print_json_host_end( apr_socket_t *client)
+{
+  apr_size_t len = 2;
+  return socket_send(client, "]}", &len); 
+}
+
+static apr_status_t
+print_json(apr_socket_t *client, apr_time_t now, apr_pool_t *client_context)
+{
+  apr_status_t status;
+  apr_hash_index_t *hi, *metric_hi;
+  void *val;
+  apr_size_t len;
+
+  /* Print the ganglia_json and cluster objects */
+  status = print_json_header(client);
+  if(status != APR_SUCCESS)
+    return status;
+
+  /* Walk the host hash */
+  int firsthost=1;
+  for(hi = apr_hash_first(client_context, hosts);
+      hi;
+      hi = apr_hash_next(hi))
+    {
+      apr_hash_this(hi, NULL, NULL, &val);
+      if(!firsthost)
+        {
+          len = 1;
+          status = socket_send(client, ",", &len);
+            if(status != APR_SUCCESS)
+              return status;
+        } else {
+          firsthost = 0;
+        }
+      status = print_json_host_start(client, (Ganglia_host *)val);
+      if(status != APR_SUCCESS)
+        return status;
+
+      /* Send the metric info for this particular host */
+      int firsthostmetric=1;
+      for(metric_hi = apr_hash_first(client_context, ((Ganglia_host *)val)->metrics);
+          metric_hi; metric_hi = apr_hash_next(metric_hi))
+        {
+          void *metric, *mval;
+          apr_hash_this(metric_hi, NULL, NULL, &metric);
+
+          mval = apr_hash_get(((Ganglia_host *)val)->gmetrics, ((Ganglia_metadata*)metric)->name, APR_HASH_KEY_STRING);
+
+          if(!firsthostmetric)
+            {
+              len = 1;
+              if (metric && mval)
+                {
+                  status = socket_send(client, ",", &len);
+                  if(status != APR_SUCCESS)
+                    return status;
+                }
+            } else {
+              firsthostmetric = 0;
+            }
+          /* Print each of the metrics for a host ... */
+          int metricused=0;
+          if(print_json_host_metric(client, metric, mval, now, &metricused) != APR_SUCCESS)
+            return status;
+          if(!metricused)
+            firsthostmetric = 1;
+        }
+
+      /* Close the host object */
+      status = print_json_host_end(client);
+      if(status != APR_SUCCESS)
+        return status;
+    }
+
+  /* Close the cluster and ganglia_json objects */
+  return print_json_footer(client);
+}
 
 static void
 process_tcp_accept_channel(const apr_pollfd_t *desc, apr_time_t now)
@@ -1799,7 +2035,8 @@ process_tcp_accept_channel(const apr_pollfd_t *desc, apr_time_t now)
 
   switch(channel->encoding) {
     case JSON_ENCODING:
-      err_msg("JSON Encoding Here.....");
+      if(!print_json(client, now, client_context))
+        goto close_accept_socket;
       break;
     case XML_ENCODING:
     default: /* XML */   
